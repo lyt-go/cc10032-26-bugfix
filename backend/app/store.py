@@ -5,10 +5,88 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import threading
 import time
+from dataclasses import dataclass, field
 from typing import Any
 
-from app.seed import SEED_ROWS
+from app.seed import SEED_GLOBAL_CHANGELOG, SEED_ROWS
+
+
+# ---------------------------------------------------------------------------
+# 源表读取状态
+#
+# 以前对账直接用 `store.rows(name) if name in store._tables else []`，
+# 把「表没登记」也当成「空表」，于是左表所有行都被算成单侧差异。
+# 这里把读取结果显式建模，空态分三种：
+#   - 表未登记（missing）：名字不在仓库里，通常是表名拼错/还没接入
+#   - 暂不可读（unreadable）：表已登记，但当前读取失败（连接、权限、快照未就绪）
+#   - 真实空表（empty）：表已登记且确实一行数据都没有
+# 只有后两种属于「读到了」；前两种必须给出原因，不能伪造空数据。
+# ---------------------------------------------------------------------------
+READ_OK = "ok"
+READ_EMPTY = "empty"
+READ_MISSING = "missing"
+READ_UNREADABLE = "unreadable"
+
+READ_STATUS_LABELS: dict[str, str] = {
+    READ_OK: "正常",
+    READ_EMPTY: "真实空表",
+    READ_MISSING: "表未登记",
+    READ_UNREADABLE: "暂不可读",
+}
+
+
+def digest_rows(rows: list[dict[str, Any]]) -> str:
+    """对一份行数据做稳定摘要，用于标识一次真实读取的读点。"""
+    payload = json.dumps(rows, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+@dataclass
+class TableRead:
+    """一次源表读取的结果：数据 + 读取状态 + 可复核的读点。"""
+
+    table: str
+    status: str
+    rows: list[dict[str, Any]] = field(default_factory=list)
+    read_point: str = ""
+    digest: str = ""
+    at: float = field(default_factory=time.time)
+    reason: str = ""
+    detail: str = ""
+
+    @property
+    def readable(self) -> bool:
+        return self.status in (READ_OK, READ_EMPTY)
+
+    @property
+    def is_empty_table(self) -> bool:
+        """真正的空表（区别于读不到）。"""
+        return self.status == READ_EMPTY
+
+    @property
+    def status_label(self) -> str:
+        return READ_STATUS_LABELS.get(self.status, self.status)
+
+    @property
+    def row_count(self) -> int:
+        return len(self.rows)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "table": self.table,
+            "status": self.status,
+            "status_label": self.status_label,
+            "readable": self.readable,
+            "read_point": self.read_point,
+            "digest": self.digest,
+            "row_count": self.row_count,
+            "read_at": self.at,
+            "reason": self.reason,
+            "detail": self.detail,
+        }
 
 
 class DataPipeline:
@@ -122,7 +200,9 @@ class Store:
         # 跨模块数据流水线
         self._pipelines: dict[str, DataPipeline] = {}
         # 全局变更日志（用于 changelog 跨模块追溯）
-        self._global_changelog: list[dict[str, Any]] = []
+        self._global_changelog: list[dict[str, Any]] = [
+            dict(record) for record in SEED_GLOBAL_CHANGELOG
+        ]
         # Schema 注册表（cross-module schema registry）
         self._schema_registry: dict[str, list[dict[str, Any]]] = {}
         # 水位偏移记录（watermark → late_data 共享）
@@ -133,12 +213,21 @@ class Store:
         self._lineage_graph: dict[str, list[dict[str, Any]]] = {}
         # 归档清单（cold_archive → retention 共享）
         self._archive_manifest: list[dict[str, Any]] = []
+        # 源表读取状态：登记过的表 + 当前不可读的表（表名 → 原因）
+        self._registered_tables: set[str] = set(self._tables)
+        self._unreadable_tables: dict[str, str] = {}
+        # 每次真实读取分配一个单调递增的读点序号，保证读点可比较先后
+        self._read_sequence = 0
+        self._lock = threading.RLock()
 
     # ---------- 基础 CRUD ----------
     def module_names(self) -> list[str]:
         return sorted(self._tables)
 
     def rows(self, module: str) -> list[dict[str, Any]]:
+        # 通过 rows() 首次触达的表同样视为「已登记」：这是写入路径，
+        # 与 read_table() 的只读语义分开，避免读操作把拼错的表名悄悄建出来。
+        self._registered_tables.add(module)
         return self._tables.setdefault(module, [])
 
     def find(self, module: str, entry_id: int) -> dict[str, Any] | None:
@@ -146,6 +235,68 @@ class Store:
             if int(row.get("id", 0)) == entry_id:
                 return row
         return None
+
+    # ---------- 源表读取状态 ----------
+    def register_table(self, table: str) -> bool:
+        """登记一张源表；重复登记返回 False。登记不等于有数据。"""
+        with self._lock:
+            if table in self._tables:
+                self._registered_tables.add(table)
+                return False
+            self._tables[table] = []
+            self._registered_tables.add(table)
+            return True
+
+    def mark_table_unreadable(self, table: str, reason: str) -> None:
+        """把已登记的表标记为暂不可读（连接/权限/快照未就绪等），读取时不得伪造空表。"""
+        with self._lock:
+            self._registered_tables.add(table)
+            self._tables.setdefault(table, [])
+            self._unreadable_tables[table] = reason
+
+    def mark_table_readable(self, table: str) -> None:
+        """恢复表的可读状态（数据本身不变）。"""
+        with self._lock:
+            self._unreadable_tables.pop(table, None)
+
+    def table_registered(self, table: str) -> bool:
+        return table in self._tables or table in self._registered_tables
+
+    def table_readable(self, table: str) -> bool:
+        return self.table_registered(table) and table not in self._unreadable_tables
+
+    def read_table(self, table: str) -> TableRead:
+        """按源表当前真实状态读取一次数据，并生成可复核的读点。
+
+        与 ``rows()`` 的区别：不会把未登记的表 ``setdefault`` 成空表，
+        也不会把不可读的表当成空表。空态在这里分成三种，前两种必须带原因。
+        """
+        with self._lock:
+            if not self.table_registered(table):
+                return TableRead(
+                    table=table,
+                    status=READ_MISSING,
+                    reason="表未登记",
+                    detail=f"仓库中没有名为 {table} 的源表，请确认表名是否正确，或先登记该源表",
+                )
+            if table in self._unreadable_tables:
+                return TableRead(
+                    table=table,
+                    status=READ_UNREADABLE,
+                    reason="暂不可读",
+                    detail=self._unreadable_tables[table] or "源表当前不可读，请稍后重试",
+                )
+            rows = [dict(row) for row in self._tables.get(table, [])]
+            self._read_sequence += 1
+            at = time.time()
+            return TableRead(
+                table=table,
+                status=READ_EMPTY if not rows else READ_OK,
+                rows=rows,
+                read_point=f"{table}@{self._read_sequence:06d}",
+                digest=digest_rows(rows),
+                at=at,
+            )
 
     def overview(self) -> dict[str, object]:
         modules: list[dict[str, object]] = []
